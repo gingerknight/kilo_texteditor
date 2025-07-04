@@ -4,12 +4,28 @@
  * These standard headers are needed for basic system and terminal manipulation:
  */
 
-#include <ctype.h>   // iscntrl(), checks for control characters like Ctrl-C
-#include <errno.h>   // errno variable and error codes
-#include <stdio.h>   // printf(), perror()
-#include <stdlib.h>  // exit(), atexit()
-#include <termios.h> // terminal I/O interfaces (tcgetattr(), tcsetattr())
-#include <unistd.h>  // read(), STDIN_FILENO
+#include <ctype.h>      // iscntrl(), checks for control characters like Ctrl-C
+#include <errno.h>      // errno variable and error codes
+#include <stdio.h>      // printf(), perror()
+#include <stdlib.h>     // exit(), atexit()
+#include <sys/ioctl.h>  // TIOCGWINSZ (Terminal IOCtl Get WINdow SiZe)
+#include <termios.h>    // terminal I/O interfaces (tcgetattr(), tcsetattr())
+#include <unistd.h>     // read(), STDIN_FILENO
+
+/*** defines ***/
+
+/*
+ * Detect specific ctrl+keys combinations based on the bytes output we disabled below as raw input.
+ * Ctrl versions of letters are just the normal characters bitwise-ANDed with 0x1f
+ * Ctrl+Q --> Quit
+ *    0111 0001   ('q')
+ * &  0001 1111   (0x1f)
+ * ------------
+ *    0001 0001   = 17 = Ctrl-Q
+ *
+ */
+
+#define CTRL_KEY(letter) ((letter) & 0x1f)
 
 /*** data ***/
 
@@ -18,7 +34,13 @@
  * when the program exits or crashes. This prevents the terminal from staying
  * in raw mode after quitting the editor.
  */
-struct termios orig_termios;
+struct editorConfig {
+    int screenrows;
+    int screencols;
+    struct termios orig_termios;
+};
+
+struct editorConfig E;
 
 /*** terminal ***/
 
@@ -26,11 +48,13 @@ struct termios orig_termios;
  * die() prints an error message and exits.
  * It uses perror() to describe the most recent system call failure.
  */
-void
-die (const char *s)
-{
-    perror (s);
-    exit (1);
+void die(const char *s) {
+    // Clear screen on exit
+    write(STDOUT_FILENO, "\x1b[2J", 4);
+    write(STDOUT_FILENO, "\x1b[H", 3);
+
+    perror(s);
+    exit(1);
 }
 
 /*
@@ -38,11 +62,8 @@ die (const char *s)
  * This gets registered with atexit() so it's called when the program exits,
  * even if it crashes or exits early.
  */
-void
-disableRawMode ()
-{
-    if (tcsetattr (STDIN_FILENO, TCSAFLUSH, &orig_termios) == -1)
-        die ("tcsetattr");
+void disableRawMode() {
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1) die("tcsetattr");
 }
 
 /*
@@ -50,17 +71,14 @@ disableRawMode ()
  * line buffering, echo, signal generation, etc. This is needed for real-time
  * key input handling in a text editor.
  */
-void
-enableRawMode ()
-{
+void enableRawMode() {
     // Get the current terminal attributes and store them for later restoration
-    if (tcgetattr (STDIN_FILENO, &orig_termios) == -1)
-        die ("tcgetattr");
+    if (tcgetattr(STDIN_FILENO, &E.orig_termios) == -1) die("tcgetattr");
 
     // Ensure disableRawMode() is called on program exit
-    atexit (disableRawMode);
+    atexit(disableRawMode);
 
-    struct termios raw = orig_termios;
+    struct termios raw = E.orig_termios;
 
     /*
      * Input flags (c_iflag):
@@ -103,52 +121,97 @@ enableRawMode ()
     raw.c_cc[VTIME] = 1;
 
     // Apply the modified attributes immediately
-    if (tcsetattr (STDIN_FILENO, TCSAFLUSH, &raw) == -1)
-        die ("tcsetattr");
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
+}
+
+/* Wait for one keypress and return it
+ * <Currently cannot handle multi-byte things like Arrow keys>
+ */
+char editorReadKey() {
+    int nread;
+    char c;
+    while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
+        if (nread == -1 && errno != EAGAIN) die("read");
+    }
+    return c;
+}
+
+/*
+ * Get window size col and row
+ */
+int getWindowSize(int *rows, int *cols) {
+    struct winsize ws;
+
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+        return -1;
+    } else {
+        *cols = ws.ws_col;
+        *rows = ws.ws_row;
+        return 0;
+    }
+}
+
+/*** output ***/
+
+/*
+ * Write column of ~ like vim
+ */
+void editorDrawRows() {
+    int y;
+    for (y = 0; y < E.screenrows; y++) {
+        write(STDOUT_FILENO, "~\r\n", 3);
+    }
+}
+/*
+ * write 4 bytes with escape sequence. Using the vt100 escape sequences.
+ * The \x1b is escape character 27
+ * https://vt100.net/docs/vt100-ug/chapter3.html#ED
+ * <esc>[2J --> Erase all of the display – all lines are erased, changed to single-width, and the cursor does not move.
+ * */
+void editorRefreshScreen() {
+    write(STDOUT_FILENO, "\x1b[2J", 4);
+    write(STDOUT_FILENO, "\x1b[H", 3);
+
+    editorDrawRows();
+
+    write(STDOUT_FILENO, "\x1b[H", 3);
+}
+
+/*** input ***/
+
+void editorProcessKeypress() {
+    char c = editorReadKey();
+
+    switch (c) {
+        case CTRL_KEY('q'):
+            write(STDOUT_FILENO, "\x1b[2J", 4);
+            write(STDOUT_FILENO, "\x1b[H", 3);
+            exit(0);
+            break;
+    }
 }
 
 /*** init ***/
 
 /*
+ * This is to initilize all the fiedls in the E struct
+ */
+void initEditor() {
+    if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
+}
+
+/*
  * Entry point for the program. Enables raw mode and enters an input loop.
  * Pressing 'q' exits the program.
  */
-int
-main ()
-{
-    enableRawMode ();
+int main() {
+    enableRawMode();
+    initEditor();
 
-    while (1)
-        {
-            char c = '\0';
-
-            /*
-             * Read one byte from standard input.
-             * - STDIN_FILENO is file descriptor 0 (standard input)
-             * - If no input is available, read() will wait up to 100ms
-             * - If read fails with a real error (not just timeout), die
-             */
-            if (read (STDIN_FILENO, &c, 1) == -1 && errno != EAGAIN)
-                die ("read");
-
-            /*
-             * iscntrl() checks if the character is a control character (e.g., Ctrl-C)
-             * If so, we print just the numeric value.
-             * Otherwise, we print both the number and the actual character.
-             */
-            if (iscntrl (c))
-                {
-                    printf ("%d\r\n", c);
-                }
-            else
-                {
-                    printf ("%d ('%c')\r\n", c, c);
-                }
-
-            // Pressing 'q' exits the loop and quits the program
-            if (c == 'q')
-                break;
-        }
+    while (1) {
+        editorRefreshScreen();
+        editorProcessKeypress();
+    }
 
     return 0;
 }
